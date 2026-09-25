@@ -1,9 +1,9 @@
 """End-to-end blocking + feature pipeline shared by train.py and predict.py."""
 from __future__ import annotations
 
+import gc
 from concurrent.futures import ProcessPoolExecutor
 
-import numpy as np
 import pandas as pd
 
 import blocking
@@ -20,6 +20,18 @@ def _normalize_chunk(df: pd.DataFrame) -> pd.DataFrame:
     return normalize.build_normalized_frame(df)
 
 
+def _split_rows(df: pd.DataFrame, n_chunks: int) -> list[pd.DataFrame]:
+    """Split a dataframe into n_chunks contiguous row-slices via plain .iloc,
+    not np.array_split. np.array_split converts a DataFrame through a numpy
+    array representation internally (hence the 'DataFrame.swapaxes is
+    deprecated' warning it throws on a DataFrame), which is both wasteful and,
+    for object-dtype columns holding Python list/str objects, meaningfully
+    more memory-hungry than the plain positional slices .iloc produces."""
+    n = len(df)
+    chunk_size = -(-n // n_chunks)  # ceil division
+    return [df.iloc[i:i + chunk_size] for i in range(0, n, chunk_size)]
+
+
 def normalize_source(df: pd.DataFrame, n_jobs: int = 1) -> pd.DataFrame:
     """Normalize a source dataframe. normalize.build_normalized_frame is pure
     per-row string work (regex/tokenization) with no cross-row dependencies,
@@ -30,14 +42,19 @@ def normalize_source(df: pd.DataFrame, n_jobs: int = 1) -> pd.DataFrame:
     n_jobs>1 splits the dataframe into that many chunks and normalizes them
     in parallel worker processes, then concatenates the results back in
     order. n_jobs<=1 (the default) runs single-threaded, unchanged from
-    before.
+    before. The process pool is created and torn down fresh each call
+    (rather than reused across the s1/s2/s3 calls a caller typically makes
+    back to back); gc.collect() after teardown gives the OS a clean point to
+    reclaim worker memory before the next call starts.
     """
     if n_jobs <= 1 or len(df) < n_jobs * MIN_ROWS_PER_WORKER_FOR_PARALLEL:
         return normalize.build_normalized_frame(df)
 
-    chunks = np.array_split(df, n_jobs)
+    chunks = _split_rows(df, n_jobs)
     with ProcessPoolExecutor(max_workers=n_jobs) as executor:
         results = list(executor.map(_normalize_chunk, chunks))
+    del chunks
+    gc.collect()
     return pd.concat(results, ignore_index=True)
 
 
