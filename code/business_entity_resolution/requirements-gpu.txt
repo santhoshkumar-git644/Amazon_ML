@@ -1,0 +1,15 @@
+# GPU branch requirements. Needs an NVIDIA GPU + matching CUDA toolkit --
+# the cluster's nodes report CUDA 12.8 via `nvidia-smi`, so target the cu12
+# RAPIDS/cupy builds. RAPIDS package names/index change between releases;
+# check https://rapids.ai for the exact current command for your CUDA
+# version before trusting this blindly.
+#
+#   pip install --extra-index-url=https://pypi.nvidia.com \
+#       cudf-cu12 cuml-cu12 cupy-cuda12x
+#   pip install xgboost   # PyPI wheel already includes CUDA ("device=cuda") support
+#
+# Not pinning exact versions here since RAPIDS releases are tied to specific
+# CUDA/driver combinations -- install whatever cu12 release matches the
+# cluster's actual CUDA toolkit version (check `nvcc --version` or the
+# loaded `module load u22/cuda/...`), rather than a version pinned blind.
+xgboost>=2.0

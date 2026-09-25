@@ -1,6 +1,11 @@
-pandas>=2.0
+# GPU branch (gpu-full-pipeline): this pipeline runs on cuDF/cuML/cupy +
+# XGBoost with device="cuda" instead of pandas/rapidfuzz/LightGBM. See
+# requirements-gpu.txt for the actual install commands -- RAPIDS is not a
+# plain `pip install`, it needs a CUDA-version-matched index/package name,
+# so it's documented there rather than pinned blindly in this file.
+#
+# numpy is still used directly for the small-scale, host-side bookkeeping in
+# train.py/predict.py (train/val id shuffling, threshold search) that never
+# needed to be on GPU in the first place.
 numpy>=1.24
-scipy>=1.10
-scikit-learn>=1.3
-rapidfuzz>=3.0
-lightgbm>=4.0
+xgboost>=2.0

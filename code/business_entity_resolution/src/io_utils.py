@@ -1,11 +1,24 @@
-"""Shared I/O helpers: loading source TSVs and writing the two submission files."""
+"""GPU I/O helpers: loading source TSVs via cuDF's GPU-accelerated CSV
+parser, and writing the two submission files.
+
+cudf.read_csv is a genuine, well-documented GPU-accelerated parser (parsing
+runs as a CUDA kernel, not on the CPU) -- higher confidence than the
+list-column operations elsewhere in this branch, since read_csv's `sep`/
+`dtype`/`na_filter` kwargs mirror pandas closely.
+
+Output writing stays plain Python file I/O: writing a few million short text
+lines is not a GPU-shaped workload (it's dominated by disk/OS calls, not
+compute), and cuDF's own to_csv doesn't produce this exact
+tab-then-comma-joined-list format directly, so results are pulled back to
+host memory (.to_pandas() / values_host) for this one small step.
+"""
 from __future__ import annotations
 
-import pandas as pd
+import cudf
 
 
-def load_source(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, na_values=[])
+def load_source(path: str) -> cudf.DataFrame:
+    df = cudf.read_csv(path, sep="\t", dtype="str", na_filter=False)
     expected = {"entity_id", "business_name", "business_address", "country"}
     missing = expected - set(df.columns)
     if missing:
@@ -13,9 +26,8 @@ def load_source(path: str) -> pd.DataFrame:
     return df
 
 
-def load_ground_truth(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, na_values=[])
-    return df
+def load_ground_truth(path: str) -> cudf.DataFrame:
+    return cudf.read_csv(path, sep="\t", dtype="str", na_filter=False)
 
 
 def write_id_list_file(path: str, s1_to_ids: dict, all_s1_ids, id_col: str, header_id_col: str):
@@ -26,9 +38,3 @@ def write_id_list_file(path: str, s1_to_ids: dict, all_s1_ids, id_col: str, head
         for s1 in all_s1_ids:
             ids = s1_to_ids.get(s1, [])
             f.write(f"{s1}\t{','.join(ids)}\n")
-
-
-def pairs_df_to_dict(pairs: pd.DataFrame, group_col: str, id_col: str) -> dict:
-    """Group a (s1_id, cand_id[, ...]) dataframe into {s1_id: [cand_id, ...]}."""
-    grouped = pairs.groupby(group_col)[id_col].apply(list)
-    return grouped.to_dict()

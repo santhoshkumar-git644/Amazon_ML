@@ -1,24 +1,22 @@
-"""Train the pairwise matching model end-to-end:
+"""Train the pairwise matching model end-to-end, GPU throughout:
 
   train_source{1,2,3}.tsv + train_ground_truth.tsv
-    -> normalize -> block (candidate generation) -> compute features
+    -> GPU normalize (cuDF) -> GPU block (cuDF merges) -> GPU features (cuDF/cuML)
     -> group-split S1 entities into train/val
-    -> train LightGBM binary classifier on (features -> is_match)
+    -> train XGBoost binary classifier on GPU (device="cuda") on (features -> is_match)
     -> tune a decision threshold on val to maximize macro F_0.5
     -> save model + threshold + feature list to models/
+
+This is the higher-confidence half of the GPU branch: XGBoost's cuDF
+integration and device="cuda" training is a standard, well-documented
+RAPIDS pattern. The lower-confidence half is what normalize.py/blocking.py/
+features.py do before this file ever runs -- see those files' docstrings.
 
 Usage (from student_resource/):
     python3 code/business_entity_resolution/src/train.py \
         --data-dir dataset/train \
         --model-dir code/business_entity_resolution/models \
-        [--max-s1 N]     # optional: subsample S1 entities for a fast dev run. Note this
-                         # only shrinks the S1 side -- S2/S3 are always used in full, since
-                         # blocking needs the complete pool to search against.
-        [--workers N]    # parallelize normalization across N processes (default: 1,
-                         # single-threaded). Normalization is pure per-row string work
-                         # with no cross-row dependencies, so this scales close to
-                         # linearly with core count -- pass the number of cores you
-                         # have allocated (e.g. --workers 10 on a 10-core SLURM job).
+        [--max-s1 N]
 """
 from __future__ import annotations
 
@@ -28,9 +26,10 @@ import os
 import sys
 import time
 
-import lightgbm as lgb
+import cudf
+import cupy as cp
 import numpy as np
-import pandas as pd
+import xgboost as xgb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import features as feat_mod
@@ -51,8 +50,12 @@ def build_labeled_pairs(s1n, s2n, s3n, gt_df, k_per_source):
     pairs = pipeline.generate_candidates(s1n, s2n, s3n, k_per_source=k_per_source)
     log(f"  -> {len(pairs)} candidate pairs in {time.time() - t0:.1f}s")
 
+    # Ground truth bookkeeping (label lookup dict, id set membership) is
+    # small-scale Python dict/set work over the S1 count, not the multi-
+    # million candidate-pair count -- no GPU benefit, stays on host exactly
+    # like the CPU version.
     truth_by_s1 = {}
-    for row in gt_df.itertuples(index=False):
+    for row in gt_df.to_pandas().itertuples(index=False):
         ids = row.matched_entity_ids.split(",") if row.matched_entity_ids else []
         truth_by_s1[row.source1_entity_id] = set(ids)
 
@@ -61,13 +64,22 @@ def build_labeled_pairs(s1n, s2n, s3n, gt_df, k_per_source):
     feats = pipeline.compute_features_for_pairs(pairs, s1n, s2n, s3n)
     log(f"  -> features shape {feats.shape} in {time.time() - t0:.1f}s")
 
-    feats["label"] = [
-        int(cand in truth_by_s1.get(s1, ())) for s1, cand in zip(feats["s1_id"], feats["cand_id"])
-    ]
+    # Label assignment: pulling s1_id/cand_id to host to check dict
+    # membership (truth_by_s1 is a Python dict, not GPU data) -- this one
+    # pair of columns round-tripping to host is unavoidable given the label
+    # source is the ground-truth file's per-entity match lists, not
+    # something expressible as a GPU join without first building a full
+    # (s1_id, cand_id) ground-truth pairs table. At candidate-pair scale
+    # (tens of millions, not billions) this round trip is not the
+    # bottleneck.
+    s1_ids_host = feats["s1_id"].to_pandas()
+    cand_ids_host = feats["cand_id"].to_pandas()
+    labels = [int(c in truth_by_s1.get(s, ())) for s, c in zip(s1_ids_host, cand_ids_host)]
+    feats["label"] = cudf.Series(labels, index=feats.index)
     return feats, truth_by_s1
 
 
-def report_blocking_recall(pairs_s1_ids, truth_by_s1, found_pairs_set, all_s1_ids):
+def report_blocking_recall(truth_by_s1, found_pairs_set, all_s1_ids):
     total_true = sum(len(truth_by_s1.get(s1, ())) for s1 in all_s1_ids)
     found_true = 0
     for s1 in all_s1_ids:
@@ -79,13 +91,13 @@ def report_blocking_recall(pairs_s1_ids, truth_by_s1, found_pairs_set, all_s1_id
     return recall
 
 
-def tune_threshold(val_feats: pd.DataFrame, probs: np.ndarray, truth_by_s1: dict,
+def tune_threshold(val_s1_host, val_cand_host, probs: np.ndarray, truth_by_s1: dict,
                     val_s1_ids) -> tuple[float, float]:
     best_t, best_f = 0.5, -1.0
     for t in np.arange(0.05, 0.96, 0.02):
         pred_by_s1 = {}
         keep = probs >= t
-        for s1, cand in zip(val_feats["s1_id"][keep], val_feats["cand_id"][keep]):
+        for s1, cand in zip(val_s1_host[keep], val_cand_host[keep]):
             pred_by_s1.setdefault(s1, set()).add(cand)
         f = metrics.macro_f_beta(pred_by_s1, truth_by_s1, val_s1_ids, beta=0.5)
         if f > best_f:
@@ -100,14 +112,13 @@ def main():
     ap.add_argument("--k-per-source", type=int, default=20)
     ap.add_argument("--max-s1", type=int, default=None,
                      help="Subsample this many S1 training entities (dev/debug speed).")
-    ap.add_argument("--workers", type=int, default=1,
-                     help="Parallelize normalization across this many processes (default: 1).")
     ap.add_argument("--val-frac", type=float, default=0.15)
+    ap.add_argument("--num-boost-round", type=int, default=2000)
     args = ap.parse_args()
 
     os.makedirs(args.model_dir, exist_ok=True)
 
-    log("loading train files ...")
+    log("loading train files (GPU CSV parse) ...")
     s1 = io_utils.load_source(os.path.join(args.data_dir, "train_source1.tsv"))
     s2 = io_utils.load_source(os.path.join(args.data_dir, "train_source2.tsv"))
     s3 = io_utils.load_source(os.path.join(args.data_dir, "train_source3.tsv"))
@@ -119,14 +130,18 @@ def main():
         gt = gt[gt["source1_entity_id"].isin(s1["entity_id"])].reset_index(drop=True)
         log(f"  subsampled to {len(s1)} S1 entities for this run")
 
-    log(f"normalizing (workers={args.workers}) ...")
+    log("normalizing (GPU) ...")
     t0 = time.time()
-    s1n = pipeline.normalize_source(s1, n_jobs=args.workers)
-    s2n = pipeline.normalize_source(s2, n_jobs=args.workers)
-    s3n = pipeline.normalize_source(s3, n_jobs=args.workers)
+    s1n = pipeline.normalize_source(s1)
+    s2n = pipeline.normalize_source(s2)
+    s3n = pipeline.normalize_source(s3)
     log(f"  -> normalized in {time.time() - t0:.1f}s")
 
-    all_s1_ids = s1n["entity_id"].tolist()
+    # Train/val split by S1 id: small-scale (S1 count, not candidate-pair
+    # count) shuffling, done on host with plain numpy exactly like the CPU
+    # version -- this bookkeeping was never the bottleneck, no reason to
+    # move it to GPU.
+    all_s1_ids = s1n["entity_id"].to_pandas().tolist()
     rng = np.random.RandomState(RANDOM_STATE)
     shuffled = rng.permutation(all_s1_ids)
     n_val = int(len(shuffled) * args.val_frac)
@@ -136,77 +151,81 @@ def main():
 
     feats, truth_by_s1 = build_labeled_pairs(s1n, s2n, s3n, gt, args.k_per_source)
 
-    found_pairs_set = set(zip(feats["s1_id"], feats["cand_id"]))
-    report_blocking_recall(feats["s1_id"], truth_by_s1, found_pairs_set, all_s1_ids)
+    found_pairs_set = set(zip(feats["s1_id"].to_pandas(), feats["cand_id"].to_pandas()))
+    report_blocking_recall(truth_by_s1, found_pairs_set, all_s1_ids)
 
     train_mask = feats["s1_id"].isin(train_ids)
     val_mask = feats["s1_id"].isin(val_ids)
     train_feats = feats[train_mask].reset_index(drop=True)
     val_feats = feats[val_mask].reset_index(drop=True)
-    log(f"train pairs={len(train_feats)} (pos={train_feats['label'].sum()}) "
-        f"val pairs={len(val_feats)} (pos={val_feats['label'].sum()})")
+    log(f"train pairs={len(train_feats)} (pos={int(train_feats['label'].sum())}) "
+        f"val pairs={len(val_feats)} (pos={int(val_feats['label'].sum())})")
 
     X_train = train_feats[feat_mod.FEATURE_COLUMNS]
     y_train = train_feats["label"]
     X_val = val_feats[feat_mod.FEATURE_COLUMNS]
     y_val = val_feats["label"]
 
-    n_pos, n_neg = y_train.sum(), len(y_train) - y_train.sum()
+    n_pos, n_neg = int(y_train.sum()), len(y_train) - int(y_train.sum())
     scale_pos_weight = (n_neg / n_pos) if n_pos else 1.0
     log(f"scale_pos_weight={scale_pos_weight:.2f}")
 
-    train_set = lgb.Dataset(X_train, label=y_train)
-    val_set = lgb.Dataset(X_val, label=y_val, reference=train_set)
+    # DMatrix accepts cuDF DataFrames/Series directly -- data stays on GPU,
+    # no host round trip. feature_names is inferred from the cuDF column
+    # names automatically.
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dval = xgb.DMatrix(X_val, label=y_val)
 
     params = {
-        "objective": "binary",
-        "metric": "average_precision",
+        "objective": "binary:logistic",
+        "eval_metric": "aucpr",
+        "device": "cuda",
+        "tree_method": "hist",
         "learning_rate": 0.05,
-        "num_leaves": 63,
-        "min_data_in_leaf": 30,
-        "feature_fraction": 0.85,
-        "bagging_fraction": 0.85,
-        "bagging_freq": 1,
+        "max_depth": 8,
+        "min_child_weight": 5,
+        "subsample": 0.85,
+        "colsample_bytree": 0.85,
         "scale_pos_weight": scale_pos_weight,
-        "verbosity": -1,
         "seed": RANDOM_STATE,
     }
 
-    log("training LightGBM ...")
-    booster = lgb.train(
-        params, train_set,
-        num_boost_round=2000,
-        valid_sets=[val_set],
-        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)],
+    log("training XGBoost on GPU (device=cuda) ...")
+    booster = xgb.train(
+        params, dtrain,
+        num_boost_round=args.num_boost_round,
+        evals=[(dval, "validation")],
+        early_stopping_rounds=50,
+        verbose_eval=100,
     )
     log(f"best iteration: {booster.best_iteration}")
 
-    val_probs = booster.predict(X_val, num_iteration=booster.best_iteration)
-    best_t, best_f = tune_threshold(val_feats, val_probs, truth_by_s1, val_ids)
+    val_probs = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
+    val_probs = cp.asarray(val_probs).get() if hasattr(val_probs, "get") else np.asarray(val_probs)
+
+    val_s1_host = val_feats["s1_id"].to_pandas().values
+    val_cand_host = val_feats["cand_id"].to_pandas().values
+    best_t, best_f = tune_threshold(val_s1_host, val_cand_host, val_probs, truth_by_s1, list(val_ids))
     log(f"BEST THRESHOLD={best_t:.2f}  VAL MACRO F0.5={best_f:.4f}")
 
-    # Full entity-level (macro) + pooled (micro) precision/recall/F1/F0.5 report at
-    # the tuned threshold. macro_f0.5 is the number that matches how the
-    # leaderboard scores matching_results.tsv; the rest is context.
     pred_by_s1 = {}
     keep = val_probs >= best_t
-    for s1, cand in zip(val_feats["s1_id"][keep], val_feats["cand_id"][keep]):
+    for s1, cand in zip(val_s1_host[keep], val_cand_host[keep]):
         pred_by_s1.setdefault(s1, set()).add(cand)
     report = metrics.full_report(pred_by_s1, truth_by_s1, list(val_ids))
     log("VALIDATION METRICS @ tuned threshold:\n" + json.dumps(report, indent=2))
 
-    # raw pairwise (row-level) precision/recall of the classifier itself, for
-    # reference only -- NOT the same as the entity-level macro numbers above.
+    y_val_host = y_val.to_pandas().values
     pred_labels = (val_probs >= best_t).astype(int)
-    tp = int(((pred_labels == 1) & (y_val == 1)).sum())
-    fp = int(((pred_labels == 1) & (y_val == 0)).sum())
-    fn = int(((pred_labels == 0) & (y_val == 1)).sum())
+    tp = int(((pred_labels == 1) & (y_val_host == 1)).sum())
+    fp = int(((pred_labels == 1) & (y_val_host == 0)).sum())
+    fn = int(((pred_labels == 0) & (y_val_host == 1)).sum())
     pair_precision = tp / (tp + fp) if (tp + fp) else 0.0
     pair_recall = tp / (tp + fn) if (tp + fn) else 0.0
     log(f"pairwise (row-level) precision={pair_precision:.4f} recall={pair_recall:.4f} "
         f"(tp={tp} fp={fp} fn={fn})")
 
-    model_path = os.path.join(args.model_dir, "matcher.txt")
+    model_path = os.path.join(args.model_dir, "matcher.json")
     booster.save_model(model_path)
     meta = {
         "feature_columns": feat_mod.FEATURE_COLUMNS,
@@ -215,16 +234,15 @@ def main():
         "pairwise_precision": pair_precision,
         "pairwise_recall": pair_recall,
         "k_per_source": args.k_per_source,
-        "best_iteration": booster.best_iteration,
+        "best_iteration": int(booster.best_iteration),
     }
     with open(os.path.join(args.model_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     log(f"saved model to {model_path} and meta.json")
 
-    importances = pd.Series(
-        booster.feature_importance(importance_type="gain"), index=feat_mod.FEATURE_COLUMNS
-    ).sort_values(ascending=False)
-    log("top feature importances (gain):\n" + importances.head(15).to_string())
+    importance = booster.get_score(importance_type="gain")
+    ranked = sorted(importance.items(), key=lambda kv: kv[1], reverse=True)
+    log("top feature importances (gain):\n" + "\n".join(f"{k}: {v:.1f}" for k, v in ranked[:15]))
 
 
 if __name__ == "__main__":
