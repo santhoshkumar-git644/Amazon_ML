@@ -161,9 +161,13 @@ def build_normalized_frame(df: pd.DataFrame) -> pd.DataFrame:
     out["business_address"] = out["business_address"].fillna("")
     out["country"] = out["country"].fillna("")
 
+    # name_tokens (all tokens, pre-stopword-filter) is only needed transiently to
+    # derive name_norm_full and core_tokens below -- not stored as an output
+    # column since nothing downstream reads it, and it's a full list-of-strings
+    # per row (expensive at multi-million-row scale). Same for has_legal_suffix:
+    # computed for potential future use but never actually consumed by
+    # blocking/features, so not worth the column's memory either.
     name_tokens = out["business_name"].map(normalize_name_tokens)
-    out["name_tokens_all"] = name_tokens
-    out["has_legal_suffix"] = name_tokens.map(has_legal_suffix)
     core_tokens = name_tokens.map(name_core_tokens)
     out["name_core_tokens"] = core_tokens
     out["name_norm"] = core_tokens.map(lambda ts: " ".join(ts))
