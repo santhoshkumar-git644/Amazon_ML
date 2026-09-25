@@ -8,7 +8,8 @@ Usage (from student_resource/):
     python3 code/business_entity_resolution/src/predict.py \
         --data-dir dataset/test \
         --model-dir code/business_entity_resolution/models \
-        --output-dir output
+        --output-dir output \
+        [--workers N]   # parallelize normalization across N processes (default: 1)
 """
 from __future__ import annotations
 
@@ -47,6 +48,8 @@ def main():
                      help="Override the k used at train time (default: use trained meta.json value).")
     ap.add_argument("--threshold", type=float, default=None,
                      help="Override the tuned decision threshold from meta.json.")
+    ap.add_argument("--workers", type=int, default=1,
+                     help="Parallelize normalization across this many processes (default: 1).")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -67,10 +70,12 @@ def main():
     log(f"  s1={len(s1)} s2={len(s2)} s3={len(s3)}")
     all_s1_ids = s1["entity_id"].tolist()
 
-    log("normalizing ...")
-    s1n = pipeline.normalize_source(s1)
-    s2n = pipeline.normalize_source(s2)
-    s3n = pipeline.normalize_source(s3)
+    log(f"normalizing (workers={args.workers}) ...")
+    t0 = time.time()
+    s1n = pipeline.normalize_source(s1, n_jobs=args.workers)
+    s2n = pipeline.normalize_source(s2, n_jobs=args.workers)
+    s3n = pipeline.normalize_source(s3, n_jobs=args.workers)
+    log(f"  -> normalized in {time.time() - t0:.1f}s")
 
     log("blocking (candidate generation) ...")
     t0 = time.time()

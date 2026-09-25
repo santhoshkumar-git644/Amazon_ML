@@ -11,9 +11,14 @@ Usage (from student_resource/):
     python3 code/business_entity_resolution/src/train.py \
         --data-dir dataset/train \
         --model-dir code/business_entity_resolution/models \
-        [--max-s1 N]   # optional: subsample S1 entities for a fast dev run. Note this
-                        # only shrinks the S1 side -- S2/S3 are always used in full, since
-                        # blocking needs the complete pool to search against.
+        [--max-s1 N]     # optional: subsample S1 entities for a fast dev run. Note this
+                         # only shrinks the S1 side -- S2/S3 are always used in full, since
+                         # blocking needs the complete pool to search against.
+        [--workers N]    # parallelize normalization across N processes (default: 1,
+                         # single-threaded). Normalization is pure per-row string work
+                         # with no cross-row dependencies, so this scales close to
+                         # linearly with core count -- pass the number of cores you
+                         # have allocated (e.g. --workers 10 on a 10-core SLURM job).
 """
 from __future__ import annotations
 
@@ -95,6 +100,8 @@ def main():
     ap.add_argument("--k-per-source", type=int, default=20)
     ap.add_argument("--max-s1", type=int, default=None,
                      help="Subsample this many S1 training entities (dev/debug speed).")
+    ap.add_argument("--workers", type=int, default=1,
+                     help="Parallelize normalization across this many processes (default: 1).")
     ap.add_argument("--val-frac", type=float, default=0.15)
     args = ap.parse_args()
 
@@ -112,10 +119,12 @@ def main():
         gt = gt[gt["source1_entity_id"].isin(s1["entity_id"])].reset_index(drop=True)
         log(f"  subsampled to {len(s1)} S1 entities for this run")
 
-    log("normalizing ...")
-    s1n = pipeline.normalize_source(s1)
-    s2n = pipeline.normalize_source(s2)
-    s3n = pipeline.normalize_source(s3)
+    log(f"normalizing (workers={args.workers}) ...")
+    t0 = time.time()
+    s1n = pipeline.normalize_source(s1, n_jobs=args.workers)
+    s2n = pipeline.normalize_source(s2, n_jobs=args.workers)
+    s3n = pipeline.normalize_source(s3, n_jobs=args.workers)
+    log(f"  -> normalized in {time.time() - t0:.1f}s")
 
     all_s1_ids = s1n["entity_id"].tolist()
     rng = np.random.RandomState(RANDOM_STATE)

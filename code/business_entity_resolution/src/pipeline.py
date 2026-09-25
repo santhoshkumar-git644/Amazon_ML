@@ -1,15 +1,44 @@
 """End-to-end blocking + feature pipeline shared by train.py and predict.py."""
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
+
+import numpy as np
 import pandas as pd
 
 import blocking
 import features as feat_mod
 import normalize
 
+# Below this row count, splitting into chunks and spinning up a process pool
+# costs more than it saves -- just normalize directly.
+MIN_ROWS_PER_WORKER_FOR_PARALLEL = 20_000
 
-def normalize_source(df: pd.DataFrame) -> pd.DataFrame:
+
+def _normalize_chunk(df: pd.DataFrame) -> pd.DataFrame:
+    """Top-level (picklable) worker function for normalize_source's parallel path."""
     return normalize.build_normalized_frame(df)
+
+
+def normalize_source(df: pd.DataFrame, n_jobs: int = 1) -> pd.DataFrame:
+    """Normalize a source dataframe. normalize.build_normalized_frame is pure
+    per-row string work (regex/tokenization) with no cross-row dependencies,
+    so it parallelizes cleanly across processes -- this is the single biggest
+    speedup available for it (there's no GPU-friendly way to do this step;
+    it's plain Python string processing, not a numeric/tensor workload).
+
+    n_jobs>1 splits the dataframe into that many chunks and normalizes them
+    in parallel worker processes, then concatenates the results back in
+    order. n_jobs<=1 (the default) runs single-threaded, unchanged from
+    before.
+    """
+    if n_jobs <= 1 or len(df) < n_jobs * MIN_ROWS_PER_WORKER_FOR_PARALLEL:
+        return normalize.build_normalized_frame(df)
+
+    chunks = np.array_split(df, n_jobs)
+    with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+        results = list(executor.map(_normalize_chunk, chunks))
+    return pd.concat(results, ignore_index=True)
 
 
 def generate_candidates(s1_norm: pd.DataFrame, s2_norm: pd.DataFrame, s3_norm: pd.DataFrame,
