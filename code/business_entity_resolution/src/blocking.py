@@ -41,6 +41,7 @@ import pandas as pd
 
 MAX_TOKEN_ABS_FREQ = 2000    # drop join tokens present in more than this many records,
                               # regardless of corpus size (an absolute, not relative, cap)
+FALLBACK_MAX_PER_TOKEN = 200  # cap candidates contributed per fallback token (see build_candidates)
 TOP_K_CANDIDATES = 30        # final candidates kept per S1 entity after rescoring
 NAME_PREFIX_LEN = 4
 
@@ -140,24 +141,30 @@ def build_candidates(s1_df: pd.DataFrame, other_df: pd.DataFrame, k: int = TOP_K
     s1_tokens = set(s1_ex["token"].unique())
 
     oth_ex_all = _explode_tokens(other_df.assign(entity_id=other_df["entity_id"]), "entity_id", "name_core_tokens")
-    oth_ex = oth_ex_all[oth_ex_all["token"].isin(s1_tokens)]
+    oth_ex = oth_ex_all[oth_ex_all["token"].isin(s1_tokens)].copy()
+    del oth_ex_all  # free the (much larger) unfiltered explode as soon as we no longer need it
 
     drop_tokens = _frequent_tokens(oth_ex) | _frequent_tokens(s1_ex)
     token_pairs = _token_join(s1_ex, oth_ex, drop_tokens)
 
     # Fallback: records whose every token got dropped as "too frequent" still get
-    # a chance via their single rarest token (join without the frequency filter),
-    # so no record is blocked out entirely just because its words are common.
+    # a chance via their single rarest token, so no record is blocked out
+    # entirely just because its words are common. This intentionally bypasses
+    # the frequency cap (that's the point -- it's the last resort), so it caps
+    # candidates per fallback token directly instead, to stay bounded even if
+    # many records share the same still-fairly-common fallback token.
     covered_s1 = set(token_pairs["s1_id"].unique())
     uncovered = s1_ex[~s1_ex["entity_id"].isin(covered_s1)]
     if len(uncovered):
-        rarest = uncovered.merge(
-            oth_ex.groupby("token").size().rename("df").reset_index(), on="token", how="left"
-        )
+        token_doc_freq = oth_ex.groupby("token").size().rename("df").reset_index()
+        rarest = uncovered.merge(token_doc_freq, on="token", how="left")
         rarest["df"] = rarest["df"].fillna(0)
         rarest = rarest.sort_values("df").drop_duplicates("entity_id")
+        fallback_pool = oth_ex[oth_ex["token"].isin(set(rarest["token"]))]
+        fallback_rank = fallback_pool.groupby("token").cumcount()
+        fallback_candidates = fallback_pool[fallback_rank < FALLBACK_MAX_PER_TOKEN]
         fallback_pairs = rarest.rename(columns={"entity_id": "s1_id"})[["s1_id", "token"]].merge(
-            oth_ex.rename(columns={"entity_id": "cand_id"}), on="token", how="inner"
+            fallback_candidates.rename(columns={"entity_id": "cand_id"}), on="token", how="inner"
         )[["s1_id", "cand_id"]]
         token_pairs = pd.concat([token_pairs, fallback_pairs], ignore_index=True)
 
