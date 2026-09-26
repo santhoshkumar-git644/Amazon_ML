@@ -94,6 +94,46 @@ def _token_join(s1_ex: pd.DataFrame, other_ex: pd.DataFrame, drop_tokens: set) -
     return pairs.iloc[:, [0, 2]].set_axis(["s1_id", "cand_id"], axis=1)
 
 
+def _keyed_join(s1_df: pd.DataFrame, other_df: pd.DataFrame, key_col: str,
+                 max_freq: int = MAX_TOKEN_ABS_FREQ) -> pd.DataFrame:
+    """Join s1_df/other_df on key_col (postal_code, name_prefix, or
+    soundex1), restricted to (a) keys that actually occur in s1_df -- the
+    same lossless-for-an-inner-join restriction the token join uses -- and
+    (b) keys that aren't so common in either side they'd blow the join up
+    disproportionately, the same MAX_TOKEN_ABS_FREQ cap the token join uses.
+
+    Postal code / name-prefix / soundex are all lower-cardinality than name
+    tokens (soundex especially: only ~26,000 possible 4-character codes).
+    At large enough S1 sizes, by pigeonhole S1 covers most of that space,
+    so restriction (a) alone stops helping -- nearly the whole other-source
+    table still passes the filter, and the join blows up many-to-many. The
+    token join has always paired restriction (a) with a frequency cap;
+    postal/prefix/soundex didn't until this function (see the GPU branch's
+    git history for the real crash -- ~9.9GB single allocation failure --
+    that this was ported to fix here before the CPU branch's full run hits
+    the same thing at a much larger scale).
+    """
+    s1_valid = s1_df[key_col] != ""
+    other_valid = other_df[key_col] != ""
+    s1_keys = s1_df.loc[s1_valid, key_col]
+    other_keys = other_df.loc[other_valid, key_col]
+
+    s1_freq = s1_keys.value_counts()
+    other_freq = other_keys.value_counts()
+    drop_keys = set(s1_freq[s1_freq > max_freq].index) | set(other_freq[other_freq > max_freq].index)
+
+    s1_key_set = set(s1_keys.unique()) - drop_keys
+    s1_side = s1_df[s1_valid & ~s1_df[key_col].isin(drop_keys)][["entity_id", key_col]]
+    other_side = other_df[
+        other_valid & other_df[key_col].isin(s1_key_set) & ~other_df[key_col].isin(drop_keys)
+    ][["entity_id", key_col]]
+
+    pairs = s1_side.merge(other_side, on=key_col, suffixes=("_s1", "_o"))[
+        ["entity_id_s1", "entity_id_o"]
+    ].set_axis(["s1_id", "cand_id"], axis=1)
+    return pairs
+
+
 def _trigrams(s: str) -> set:
     s = f"  {s} "
     return {s[i:i + 3] for i in range(len(s) - 2)}
@@ -168,33 +208,16 @@ def build_candidates(s1_df: pd.DataFrame, other_df: pd.DataFrame, k: int = TOP_K
         )[["s1_id", "cand_id"]]
         token_pairs = pd.concat([token_pairs, fallback_pairs], ignore_index=True)
 
-    # Same principle as the token join above: restrict each key column's
-    # "other side" to values that actually occur in s1_df before merging, so
-    # a common postal code / prefix / soundex code in the other source can't
-    # blow up the join with candidates s1_df could never have matched anyway.
-    s1_postal = set(s1_df.loc[s1_df["postal_code"] != "", "postal_code"])
-    postal_pairs = s1_df[s1_df["postal_code"] != ""][["entity_id", "postal_code"]].merge(
-        other_df[other_df["postal_code"].isin(s1_postal)][["entity_id", "postal_code"]],
-        on="postal_code", suffixes=("_s1", "_o"),
-    )[["entity_id_s1", "entity_id_o"]].set_axis(["s1_id", "cand_id"], axis=1)
-
     s1_df = s1_df.copy()
     other_df = other_df.copy()
     s1_df["name_prefix"] = s1_df["name_norm"].str.slice(0, NAME_PREFIX_LEN)
     other_df["name_prefix"] = other_df["name_norm"].str.slice(0, NAME_PREFIX_LEN)
-    s1_prefixes = set(s1_df.loc[s1_df["name_prefix"] != "", "name_prefix"])
-    prefix_pairs = s1_df[s1_df["name_prefix"] != ""][["entity_id", "name_prefix"]].merge(
-        other_df[other_df["name_prefix"].isin(s1_prefixes)][["entity_id", "name_prefix"]],
-        on="name_prefix", suffixes=("_s1", "_o"),
-    )[["entity_id_s1", "entity_id_o"]].set_axis(["s1_id", "cand_id"], axis=1)
-
     s1_df["soundex1"] = s1_df["name_core_tokens"].map(lambda ts: _soundex(ts[0]) if ts else "")
     other_df["soundex1"] = other_df["name_core_tokens"].map(lambda ts: _soundex(ts[0]) if ts else "")
-    s1_soundex = set(s1_df.loc[s1_df["soundex1"] != "", "soundex1"])
-    sdx_pairs = s1_df[s1_df["soundex1"] != ""][["entity_id", "soundex1"]].merge(
-        other_df[other_df["soundex1"].isin(s1_soundex)][["entity_id", "soundex1"]],
-        on="soundex1", suffixes=("_s1", "_o"),
-    )[["entity_id_s1", "entity_id_o"]].set_axis(["s1_id", "cand_id"], axis=1)
+
+    postal_pairs = _keyed_join(s1_df, other_df, "postal_code")
+    prefix_pairs = _keyed_join(s1_df, other_df, "name_prefix")
+    sdx_pairs = _keyed_join(s1_df, other_df, "soundex1")
 
     all_pairs = pd.concat([token_pairs, postal_pairs, prefix_pairs, sdx_pairs], ignore_index=True)
     if all_pairs.empty:
