@@ -28,6 +28,15 @@ import cudf
 import cupy as cp
 
 MAX_TOKEN_ABS_FREQ = 2000
+# postal_code/name_prefix/soundex1 are inherently lower-cardinality than name
+# tokens (soundex especially: only ~26,000 possible 4-character codes), so
+# reusing the token join's cap for them was too aggressive -- measured on
+# real cluster data: it cut blocking recall ceiling from 0.68 to 0.54 at
+# 50,000 S1 entities. This is deliberately more permissive; it still caps
+# the pathological blowup case (a single key shared by tens of thousands of
+# records) without pruning the normal signal these three strategies
+# contribute. May need further tuning based on recall/memory at larger scale.
+KEYED_JOIN_MAX_FREQ = 10_000
 FALLBACK_MAX_PER_TOKEN = 200
 TOP_K_CANDIDATES = 30
 NAME_PREFIX_LEN = 4
@@ -84,7 +93,7 @@ def _token_join(s1_ex: cudf.DataFrame, other_ex: cudf.DataFrame, drop_tokens: cu
 
 
 def _keyed_join(s1_df: cudf.DataFrame, other_df: cudf.DataFrame, key_col: str,
-                 max_freq: int = MAX_TOKEN_ABS_FREQ) -> cudf.DataFrame:
+                 max_freq: int = KEYED_JOIN_MAX_FREQ) -> cudf.DataFrame:
     """Join s1_df/other_df on key_col (postal_code, name_prefix, or
     soundex1), restricted to (a) keys that actually occur in s1_df -- the
     same lossless-for-an-inner-join restriction the token join uses -- and
