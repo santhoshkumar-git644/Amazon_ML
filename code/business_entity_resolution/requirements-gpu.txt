@@ -5,8 +5,15 @@
 # version before trusting this blindly.
 #
 #   pip install --extra-index-url=https://pypi.nvidia.com \
-#       cudf-cu12 cuml-cu12 cupy-cuda12x
+#       cudf-cu12 cupy-cuda12x
 #   pip install xgboost   # PyPI wheel already includes CUDA ("device=cuda") support
+#
+# cuml-cu12 is NOT needed -- an earlier version of this pipeline used
+# cuML's TfidfVectorizer for similarity scoring, but it crashed on real
+# cluster data with an apparent internal bug; replaced with a cuDF-native
+# char n-gram Jaccard implementation instead (see blocking.py). If it's
+# already installed from an earlier attempt, it's harmless to leave, just
+# unused.
 #
 # Not pinning exact versions here since RAPIDS releases are tied to specific
 # CUDA/driver combinations -- install whatever cu12 release matches the

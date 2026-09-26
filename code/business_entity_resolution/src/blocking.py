@@ -1,8 +1,8 @@
 """GPU candidate generation (blocking) for the Business Entity Resolution challenge.
 
-Rewritten on RAPIDS cuDF (GPU merges) + cuML (GPU TF-IDF/cosine similarity)
+Rewritten on RAPIDS cuDF (GPU merges + native char n-gram string ops)
 instead of pandas + a Python trigram-Jaccard loop. UNVERIFIED: written from
-documented cuDF/cuML APIs; I have no GPU available to execute this.
+documented cuDF APIs; I have no GPU available to execute this.
 
 Strategy (same four blocking keys as the CPU version, still a union):
 1. Token blocking: explode S1/other core-name tokens, inner-join on token
@@ -12,14 +12,12 @@ Strategy (same four blocking keys as the CPU version, still a union):
    join *cardinality*, not CPU-vs-GPU, so it still matters here.
 2. Postal-code / name-prefix / soundex blocking: same idea, GPU merges.
 3. Rescoring: the CPU version scores candidates with a Python loop computing
-   character-trigram Jaccard per pair. There is no GPU-vectorized way to do
-   per-pair Python set operations, so this is replaced with a genuinely
-   GPU-native equivalent: cuML's TfidfVectorizer (character n-grams) fit
-   once over all names, transformed into GPU sparse vectors, with cosine
-   similarity computed per (s1, candidate) pair via a GPU sparse row-wise
-   dot product. This is not numerically identical to trigram Jaccard, but
-   is the same kind of signal (character-level name similarity) computed
-   entirely on GPU.
+   character-trigram Jaccard per pair. Reimplemented here with
+   gpu_char_ngram_jaccard() below, using cuDF's native `.str.character_ngrams()`
+   plus the same explode/merge/groupby pattern as features.py's word-token
+   Jaccard -- not cuML, after cuML's TfidfVectorizer proved to crash on real
+   cluster data (see git history) with what looks like an internal bug, not
+   something fixable from the calling code.
 
 Soundex is kept as plain Python (it's a tiny per-token computation over a
 small number of distinct first-tokens, not a bottleneck worth a GPU kernel).
@@ -28,7 +26,6 @@ from __future__ import annotations
 
 import cudf
 import cupy as cp
-from cuml.feature_extraction.text import TfidfVectorizer
 
 MAX_TOKEN_ABS_FREQ = 2000
 FALLBACK_MAX_PER_TOKEN = 200
@@ -86,46 +83,45 @@ def _token_join(s1_ex: cudf.DataFrame, other_ex: cudf.DataFrame, drop_tokens: cu
     return pairs
 
 
-def _gpu_char_ngram_cosine(s1_ids: cudf.Series, s1_names: cudf.Series,
-                            cand_ids: cudf.Series, cand_names: cudf.Series,
-                            all_names_for_fit: cudf.Series) -> cp.ndarray:
-    """Fit a char n-gram TF-IDF vectorizer once (GPU, cuML), transform both
-    sides of each pair, and return the per-pair cosine similarity -- the
-    GPU-native replacement for the CPU version's per-pair trigram Jaccard
-    Python loop. UNVERIFIED: cuML's TfidfVectorizer analyzer="char_wb" /
-    ngram_range support and exact constructor kwargs should be checked
-    against the installed cuml version; this mirrors scikit-learn's API,
-    which cuML's text vectorizers generally track but not always exactly.
+def gpu_char_ngram_jaccard(a: cudf.Series, b: cudf.Series, n: int = 3) -> cp.ndarray:
+    """Row-aligned character n-gram Jaccard similarity between a[i] and b[i]
+    -- GPU-native reimplementation of the CPU version's per-pair trigram
+    Jaccard Python loop, using cuDF's own `.str.character_ngrams()` (core
+    cuDF string functionality, not cuML's separate text-vectorizer layer).
+
+    Switched to this from a cuML TfidfVectorizer-based cosine similarity
+    after that approach crashed on real cluster data with a raw
+    ValueError("cannot reindex on an axis with duplicate labels") from
+    inside cuml's own tokenizer, even after fitting on de-duplicated input
+    -- an apparent bug in that part of cuML I can't debug without GPU
+    access. This reuses the same explode -> pairwise-intersect/union ->
+    groupby-count pattern as features.py's _gpu_word_token_jaccard, which
+    is plain cuDF (merge/groupby/explode), not cuML.
     """
-    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3), lowercase=False)
-    # cuML's char-ngram tokenizer breaks on a raw ValueError("cannot reindex
-    # on an axis with duplicate labels") when the input text has many
-    # duplicate values -- fitting the vocabulary/IDF weights doesn't need
-    # repeated identical documents anyway, so dedup first.
-    vectorizer.fit(all_names_for_fit.unique())
+    n_rows = len(a)
+    row_id = cudf.Series(cp.arange(n_rows))
+    padded_a = (" " + a.fillna("") + " ")
+    padded_b = (" " + b.fillna("") + " ")
 
-    s1_vecs = vectorizer.transform(s1_names)
-    cand_vecs = vectorizer.transform(cand_names)
+    tg_a = padded_a.str.character_ngrams(n, as_list=True)
+    tg_b = padded_b.str.character_ngrams(n, as_list=True)
 
-    # row-wise cosine similarity between s1_vecs[i] and cand_vecs[i] (already
-    # aligned 1:1 per pair, not an all-pairs matrix): normalize each sparse
-    # row to unit length, then the dot product of matched rows *is* the
-    # cosine similarity. cupy.sparse elementwise-multiply + sum-per-row keeps
-    # this on GPU throughout.
-    def _row_norms(mat):
-        sq = mat.multiply(mat)
-        return cp.sqrt(cp.asarray(sq.sum(axis=1)).ravel())
+    ea = cudf.DataFrame({"row_id": row_id, "tg": tg_a}).explode("tg").dropna()
+    eb = cudf.DataFrame({"row_id": row_id, "tg": tg_b}).explode("tg").dropna()
+    ea = ea.drop_duplicates(["row_id", "tg"])
+    eb = eb.drop_duplicates(["row_id", "tg"])
 
-    s1_norms = _row_norms(s1_vecs)
-    cand_norms = _row_norms(cand_vecs)
-    dots = cp.asarray(s1_vecs.multiply(cand_vecs).sum(axis=1)).ravel()
-    denom = s1_norms * cand_norms
-    denom[denom == 0] = 1.0
-    return dots / denom
+    inter = ea.merge(eb, on=["row_id", "tg"], how="inner").groupby("row_id").size()
+    union = cudf.concat([ea, eb]).drop_duplicates(["row_id", "tg"]).groupby("row_id").size()
+
+    inter = inter.reindex(row_id.values).fillna(0)
+    union = union.reindex(row_id.values).fillna(0)
+    result = (inter / union.where(union != 0, 1)).fillna(0.0)
+    return cp.asarray(result.values)
 
 
 def _rescore_and_topk(pairs: cudf.DataFrame, s1_norm: cudf.Series, cand_norm: cudf.Series,
-                       all_names_for_fit: cudf.Series, k: int) -> cudf.DataFrame:
+                       k: int) -> cudf.DataFrame:
     n_sources = pairs.groupby(["s1_id", "cand_id"]).size()
     pairs = pairs.drop_duplicates(["s1_id", "cand_id"])
     pairs = pairs.set_index(["s1_id", "cand_id"])
@@ -134,9 +130,7 @@ def _rescore_and_topk(pairs: cudf.DataFrame, s1_norm: cudf.Series, cand_norm: cu
 
     s1_names = pairs["s1_id"].map(s1_norm)
     cand_names = pairs["cand_id"].map(cand_norm)
-    pairs["score"] = _gpu_char_ngram_cosine(
-        pairs["s1_id"], s1_names, pairs["cand_id"], cand_names, all_names_for_fit
-    )
+    pairs["score"] = gpu_char_ngram_jaccard(s1_names, cand_names, n=3)
 
     pairs = pairs.sort_values(["s1_id", "score"], ascending=[True, False])
     pairs["candidate_rank"] = pairs.groupby("s1_id").cumcount()
@@ -221,6 +215,5 @@ def build_candidates(s1_df: cudf.DataFrame, other_df: cudf.DataFrame, k: int = T
 
     s1_norm = s1_df.set_index("entity_id")["name_norm"]
     cand_norm = other_df.set_index("entity_id")["name_norm"]
-    all_names_for_fit = cudf.concat([s1_norm, cand_norm]).reset_index(drop=True)
-    result = _rescore_and_topk(all_pairs, s1_norm, cand_norm, all_names_for_fit, k)
+    result = _rescore_and_topk(all_pairs, s1_norm, cand_norm, k)
     return result

@@ -1,31 +1,31 @@
 """GPU pairwise feature computation for the entity-matching model.
 
-Rewritten on cuDF/cupy/cuML. UNVERIFIED: written from documented APIs; no
-GPU available here to execute it.
+Rewritten on cuDF/cupy. UNVERIFIED: written from documented APIs; no GPU
+available here to execute it.
 
 Honest limitation, flagged up front rather than glossed over: the CPU
 version's edit-distance features (Levenshtein similarity, Jaro-Winkler via
 rapidfuzz.fuzz.WRatio, token_sort_ratio, partial_ratio) have **no mature GPU
 library equivalent** I can point to with confidence -- rapidfuzz itself is
-CPU-only (C-accelerated, but CPU), and there is no widely-used GPU port of
-these specific string-distance algorithms. Rather than silently keep those
-four features running on CPU inside an otherwise-GPU pipeline (which would
-contradict "everything on GPU"), they're replaced here with GPU-native
-substitutes:
-  - name_lev_ratio, name_jw, name_token_sort_ratio, name_partial_ratio,
-    addr_lev_ratio, addr_token_sort_ratio
-    -> all replaced by variants of the same char n-gram TF-IDF cosine
-       similarity used in blocking.py's GPU rescoring (different n-gram
-       windows / word-level vs char-level where it maps reasonably).
-This is a real change in what the model is trained on, not a drop-in
-equivalent -- flagging this explicitly so it's an informed choice, not a
-silently swapped detail.
+CPU-only (C-accelerated, but CPU). Rather than silently keep those four
+features running on CPU inside an otherwise-GPU pipeline, they're replaced
+here with GPU-native substitutes: character n-gram Jaccard similarity (via
+blocking.gpu_char_ngram_jaccard, cuDF-native, no cuML) at two n-gram widths
+(bigram, trigram), reused across the four slots that held distinct
+edit-distance measures on the CPU. This is a real change in what the model
+trains on, not a drop-in equivalent -- flagging this explicitly.
+
+(An earlier version of this file used cuML's TfidfVectorizer for a
+cosine-similarity variant of this; that crashed on real cluster data with
+an apparent internal cuML bug -- see git history. Consolidated to fewer,
+cuDF-native computations for reliability.)
 """
 from __future__ import annotations
 
 import cudf
 import cupy as cp
-from cuml.feature_extraction.text import TfidfVectorizer
+
+import blocking
 
 FEATURE_COLUMNS = [
     "name_jaccard", "name_lev_ratio", "name_jw", "name_token_sort_ratio",
@@ -38,29 +38,6 @@ FEATURE_COLUMNS = [
     "country_match", "country_both_present",
     "blocking_score", "n_blocking_sources", "candidate_rank", "score_gap_to_next",
 ]
-
-
-def _gpu_pairwise_char_cosine(a: cudf.Series, b: cudf.Series, all_text_for_fit: cudf.Series,
-                               ngram_range: tuple[int, int] = (3, 3)) -> cp.ndarray:
-    """1:1 row-aligned cosine similarity between a[i] and b[i], char n-grams,
-    TF-IDF weighted, fit once over all_text_for_fit -- same GPU pattern as
-    blocking.py's _gpu_char_ngram_cosine."""
-    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=ngram_range, lowercase=False)
-    # See blocking.py's _gpu_char_ngram_cosine: cuML's char-ngram tokenizer
-    # breaks on duplicate-heavy input text with a raw cudf reindex
-    # ValueError. Fitting the vocabulary doesn't need duplicates anyway.
-    vectorizer.fit(all_text_for_fit.unique())
-    va = vectorizer.transform(a)
-    vb = vectorizer.transform(b)
-
-    def _row_norms(mat):
-        sq = mat.multiply(mat)
-        return cp.sqrt(cp.asarray(sq.sum(axis=1)).ravel())
-
-    dots = cp.asarray(va.multiply(vb).sum(axis=1)).ravel()
-    denom = _row_norms(va) * _row_norms(vb)
-    denom[denom == 0] = 1.0
-    return dots / denom
 
 
 def _gpu_word_token_jaccard(a: cudf.Series, b: cudf.Series) -> cp.ndarray:
@@ -130,14 +107,16 @@ def compute_features(pairs: cudf.DataFrame, s1_norm: cudf.DataFrame, other_norm:
     o = other_norm.loc[pairs["cand_id"]].reset_index(drop=True)
     out = pairs.reset_index(drop=True).copy()
 
-    all_names = cudf.concat([s1["name_norm"], o["name_norm"]]).reset_index(drop=True)
-    all_addrs = cudf.concat([s1["addr_norm"], o["addr_norm"]]).reset_index(drop=True)
-
     out["name_jaccard"] = _gpu_word_token_jaccard(s1["name_core_tokens"], o["name_core_tokens"])
-    out["name_lev_ratio"] = _gpu_pairwise_char_cosine(s1["name_norm"], o["name_norm"], all_names, (2, 3))
-    out["name_jw"] = _gpu_pairwise_char_cosine(s1["name_norm"], o["name_norm"], all_names, (1, 2))
-    out["name_token_sort_ratio"] = _gpu_pairwise_char_cosine(s1["name_norm"], o["name_norm"], all_names, (3, 3))
-    out["name_partial_ratio"] = out["name_token_sort_ratio"]  # no GPU partial-match equivalent; reuse
+    name_bigram_jaccard = blocking.gpu_char_ngram_jaccard(s1["name_norm"], o["name_norm"], n=2)
+    name_trigram_jaccard = blocking.gpu_char_ngram_jaccard(s1["name_norm"], o["name_norm"], n=3)
+    out["name_lev_ratio"] = name_bigram_jaccard
+    out["name_jw"] = name_trigram_jaccard
+    # name_token_sort_ratio / name_partial_ratio: no GPU equivalent of rapidfuzz's
+    # word-order-invariant / substring-partial matching -- reusing the char
+    # n-gram Jaccard values rather than inventing more untested GPU ops.
+    out["name_token_sort_ratio"] = name_trigram_jaccard
+    out["name_partial_ratio"] = name_bigram_jaccard
     len_a = s1["name_norm"].str.len().clip(lower=1)
     len_b = o["name_norm"].str.len().clip(lower=1)
     out["name_len_ratio"] = cudf.Series(cp.minimum(len_a.values, len_b.values)) / cudf.Series(
@@ -149,8 +128,8 @@ def compute_features(pairs: cudf.DataFrame, s1_norm: cudf.DataFrame, other_norm:
     out["same_script"] = (s1["name_script"] == o["name_script"]).astype("int32")
 
     out["addr_jaccard"] = _gpu_word_token_jaccard(s1["addr_tokens"], o["addr_tokens"])
-    out["addr_lev_ratio"] = _gpu_pairwise_char_cosine(s1["addr_norm"], o["addr_norm"], all_addrs, (2, 3))
-    out["addr_token_sort_ratio"] = _gpu_pairwise_char_cosine(s1["addr_norm"], o["addr_norm"], all_addrs, (3, 3))
+    out["addr_lev_ratio"] = blocking.gpu_char_ngram_jaccard(s1["addr_norm"], o["addr_norm"], n=2)
+    out["addr_token_sort_ratio"] = blocking.gpu_char_ngram_jaccard(s1["addr_norm"], o["addr_norm"], n=3)
 
     s1_post, o_post = s1["postal_code"], o["postal_code"]
     both_post = (s1_post != "") & (o_post != "")
