@@ -83,43 +83,14 @@ def _token_join(s1_ex: cudf.DataFrame, other_ex: cudf.DataFrame, drop_tokens: cu
     return pairs
 
 
-def gpu_char_ngram_jaccard(a: cudf.Series, b: cudf.Series, n: int = 3) -> cp.ndarray:
-    """Row-aligned character n-gram Jaccard similarity between a[i] and b[i]
-    -- GPU-native reimplementation of the CPU version's per-pair trigram
-    Jaccard Python loop, using cuDF's own `.str.character_ngrams()` (core
-    cuDF string functionality, not cuML's separate text-vectorizer layer).
-
-    Switched to this from a cuML TfidfVectorizer-based cosine similarity
-    after that approach crashed on real cluster data with a raw
-    ValueError("cannot reindex on an axis with duplicate labels") from
-    inside cuml's own tokenizer, even after fitting on de-duplicated input
-    -- an apparent bug in that part of cuML I can't debug without GPU
-    access. This reuses the same explode -> pairwise-intersect/union ->
-    groupby-count pattern as features.py's _gpu_word_token_jaccard, which
-    is plain cuDF (merge/groupby/explode), not cuML.
-    """
-    # Real crash from the cluster at 5000-entity scale: exploding character
-    # n-grams for every ROW blew up GPU memory (CUDA out-of-memory trying
-    # to allocate ~6.8GB) once the pre-top-k candidate pool got large
-    # enough. Many rows share the exact same (a, b) string pair -- e.g. one
-    # S1 entity's name repeats once per candidate it's paired with -- so
-    # this scores each UNIQUE (a, b) value pair once, not once per row, and
-    # maps the result back. Pure value-based deduplication: the result is
-    # identical to scoring every row directly, just without redoing (and
-    # re-allocating GPU memory for) the same computation for duplicate rows.
-    n_rows = len(a)
-    orig_row_id = cp.arange(n_rows)
-    pairs_df = cudf.DataFrame({
-        "orig_row_id": orig_row_id,
-        "a": a.reset_index(drop=True),
-        "b": b.reset_index(drop=True),
-    })
-    unique_pairs = pairs_df[["a", "b"]].drop_duplicates().reset_index(drop=True)
-    u_row_id = cudf.Series(cp.arange(len(unique_pairs)))
-    unique_pairs["u_row_id"] = u_row_id
-
-    padded_a = " " + unique_pairs["a"].fillna("") + " "
-    padded_b = " " + unique_pairs["b"].fillna("") + " "
+def _score_unique_batch(batch: cudf.DataFrame, n: int) -> cudf.DataFrame:
+    """Score one batch of unique (a, b) pairs. batch must have columns
+    a, b, u_row_id (0..len(batch)-1). Returns batch with a "score" column
+    added. Split out of gpu_char_ngram_jaccard so peak memory is bounded by
+    one batch's explode, not the full unique-pair set's."""
+    u_row_id = batch["u_row_id"]
+    padded_a = " " + batch["a"].fillna("") + " "
+    padded_b = " " + batch["b"].fillna("") + " "
     tg_a = padded_a.str.character_ngrams(n, as_list=True)
     tg_b = padded_b.str.character_ngrams(n, as_list=True)
 
@@ -132,13 +103,72 @@ def gpu_char_ngram_jaccard(a: cudf.Series, b: cudf.Series, n: int = 3) -> cp.nda
     union = cudf.concat([ea, eb]).drop_duplicates(["u_row_id", "tg"]).groupby("u_row_id").size()
     inter = inter.reindex(u_row_id.values).fillna(0)
     union = union.reindex(u_row_id.values).fillna(0)
-    unique_pairs["score"] = (inter / union.where(union != 0, 1)).fillna(0.0).values
+    batch = batch.copy()
+    batch["score"] = (inter / union.where(union != 0, 1)).fillna(0.0).values
+    return batch
+
+
+def gpu_char_ngram_jaccard(a: cudf.Series, b: cudf.Series, n: int = 3,
+                           batch_size: int = 20_000) -> cp.ndarray:
+    """Row-aligned character n-gram Jaccard similarity between a[i] and b[i]
+    -- GPU-native reimplementation of the CPU version's per-pair trigram
+    Jaccard Python loop, using cuDF's own `.str.character_ngrams()` (core
+    cuDF string functionality, not cuML's separate text-vectorizer layer).
+
+    Switched to this from a cuML TfidfVectorizer-based cosine similarity
+    after that approach crashed on real cluster data with a raw
+    ValueError("cannot reindex on an axis with duplicate labels") from
+    inside cuml's own tokenizer -- an apparent bug in that part of cuML I
+    can't debug without GPU access. This reuses the same
+    explode -> pairwise-intersect/union -> groupby-count pattern as
+    features.py's _gpu_word_token_jaccard, which is plain cuDF
+    (merge/groupby/explode), not cuML.
+
+    Two real OOM crashes from the cluster shaped this function's current
+    structure:
+    1. Exploding character n-grams for every ROW (not just unique values)
+       ran out of GPU memory once the pre-top-k candidate pool got large
+       (~6.8GB single allocation failure at 5000 S1 entities). Fixed by
+       deduplicating to unique (a, b) string pairs first -- pure caching,
+       since the score only depends on the string values, not row identity.
+    2. Deduplication alone wasn't enough at the same 5000-entity scale --
+       the unique-pair set itself was still large enough that a *second*
+       allocation failed (~4.4GB) inside .dropna(), with nvidia-smi showing
+       usage climb past 36GB first. That's consistent with needing roughly
+       2x memory during explode/dropna (the new filtered/compacted buffer
+       has to be allocated before the old one is freed). Fixed by batching:
+       process batch_size unique pairs at a time instead of all of them in
+       one GPU operation, so peak memory is bounded by one batch regardless
+       of how large the total unique-pair set grows. cupy's memory pool is
+       explicitly flushed between batches so freed memory is actually
+       returned, not just cached for reuse within the pool.
+    """
+    n_rows = len(a)
+    orig_row_id = cp.arange(n_rows)
+    pairs_df = cudf.DataFrame({
+        "orig_row_id": orig_row_id,
+        "a": a.reset_index(drop=True),
+        "b": b.reset_index(drop=True),
+    })
+    unique_pairs = pairs_df[["a", "b"]].drop_duplicates().reset_index(drop=True)
+    n_unique = len(unique_pairs)
+
+    scored_parts = []
+    for start in range(0, n_unique, batch_size):
+        batch = unique_pairs.iloc[start:start + batch_size].reset_index(drop=True)
+        batch["u_row_id"] = cudf.Series(cp.arange(len(batch)))
+        scored_batch = _score_unique_batch(batch, n)
+        scored_parts.append(scored_batch[["a", "b", "score"]])
+        del batch, scored_batch
+        cp.get_default_memory_pool().free_all_blocks()
+
+    unique_scored = cudf.concat(scored_parts, ignore_index=True)
 
     # Map back to the original row order. A merge doesn't guarantee it
     # preserves left-frame row order, so sort by the explicit orig_row_id
     # afterward rather than assuming the merge kept it -- getting this
     # wrong would silently assign the wrong score to the wrong pair.
-    scored = pairs_df.merge(unique_pairs[["a", "b", "score"]], on=["a", "b"], how="left")
+    scored = pairs_df.merge(unique_scored, on=["a", "b"], how="left")
     scored = scored.sort_values("orig_row_id")
     return cp.asarray(scored["score"].values)
 
