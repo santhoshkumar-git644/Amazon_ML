@@ -98,26 +98,49 @@ def gpu_char_ngram_jaccard(a: cudf.Series, b: cudf.Series, n: int = 3) -> cp.nda
     groupby-count pattern as features.py's _gpu_word_token_jaccard, which
     is plain cuDF (merge/groupby/explode), not cuML.
     """
+    # Real crash from the cluster at 5000-entity scale: exploding character
+    # n-grams for every ROW blew up GPU memory (CUDA out-of-memory trying
+    # to allocate ~6.8GB) once the pre-top-k candidate pool got large
+    # enough. Many rows share the exact same (a, b) string pair -- e.g. one
+    # S1 entity's name repeats once per candidate it's paired with -- so
+    # this scores each UNIQUE (a, b) value pair once, not once per row, and
+    # maps the result back. Pure value-based deduplication: the result is
+    # identical to scoring every row directly, just without redoing (and
+    # re-allocating GPU memory for) the same computation for duplicate rows.
     n_rows = len(a)
-    row_id = cudf.Series(cp.arange(n_rows))
-    padded_a = (" " + a.fillna("") + " ")
-    padded_b = (" " + b.fillna("") + " ")
+    orig_row_id = cp.arange(n_rows)
+    pairs_df = cudf.DataFrame({
+        "orig_row_id": orig_row_id,
+        "a": a.reset_index(drop=True),
+        "b": b.reset_index(drop=True),
+    })
+    unique_pairs = pairs_df[["a", "b"]].drop_duplicates().reset_index(drop=True)
+    u_row_id = cudf.Series(cp.arange(len(unique_pairs)))
+    unique_pairs["u_row_id"] = u_row_id
 
+    padded_a = " " + unique_pairs["a"].fillna("") + " "
+    padded_b = " " + unique_pairs["b"].fillna("") + " "
     tg_a = padded_a.str.character_ngrams(n, as_list=True)
     tg_b = padded_b.str.character_ngrams(n, as_list=True)
 
-    ea = cudf.DataFrame({"row_id": row_id, "tg": tg_a}).explode("tg").dropna()
-    eb = cudf.DataFrame({"row_id": row_id, "tg": tg_b}).explode("tg").dropna()
-    ea = ea.drop_duplicates(["row_id", "tg"])
-    eb = eb.drop_duplicates(["row_id", "tg"])
+    ea = cudf.DataFrame({"u_row_id": u_row_id, "tg": tg_a}).explode("tg").dropna()
+    eb = cudf.DataFrame({"u_row_id": u_row_id, "tg": tg_b}).explode("tg").dropna()
+    ea = ea.drop_duplicates(["u_row_id", "tg"])
+    eb = eb.drop_duplicates(["u_row_id", "tg"])
 
-    inter = ea.merge(eb, on=["row_id", "tg"], how="inner").groupby("row_id").size()
-    union = cudf.concat([ea, eb]).drop_duplicates(["row_id", "tg"]).groupby("row_id").size()
+    inter = ea.merge(eb, on=["u_row_id", "tg"], how="inner").groupby("u_row_id").size()
+    union = cudf.concat([ea, eb]).drop_duplicates(["u_row_id", "tg"]).groupby("u_row_id").size()
+    inter = inter.reindex(u_row_id.values).fillna(0)
+    union = union.reindex(u_row_id.values).fillna(0)
+    unique_pairs["score"] = (inter / union.where(union != 0, 1)).fillna(0.0).values
 
-    inter = inter.reindex(row_id.values).fillna(0)
-    union = union.reindex(row_id.values).fillna(0)
-    result = (inter / union.where(union != 0, 1)).fillna(0.0)
-    return cp.asarray(result.values)
+    # Map back to the original row order. A merge doesn't guarantee it
+    # preserves left-frame row order, so sort by the explicit orig_row_id
+    # afterward rather than assuming the merge kept it -- getting this
+    # wrong would silently assign the wrong score to the wrong pair.
+    scored = pairs_df.merge(unique_pairs[["a", "b", "score"]], on=["a", "b"], how="left")
+    scored = scored.sort_values("orig_row_id")
+    return cp.asarray(scored["score"].values)
 
 
 def _rescore_and_topk(pairs: cudf.DataFrame, s1_norm: cudf.Series, cand_norm: cudf.Series,
