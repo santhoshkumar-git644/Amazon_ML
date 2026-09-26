@@ -68,12 +68,24 @@ def _gpu_word_token_jaccard(a: cudf.Series, b: cudf.Series) -> cp.ndarray:
 
 
 def _gpu_acronym_match(a_tokens: cudf.Series, b_tokens: cudf.Series) -> cp.ndarray:
-    """UNVERIFIED. Initials-of-multi-token-name vs single-token-name match,
-    vectorized via list column ops (.list.len(), string .str.get(0) applied
-    per exploded token then re-joined). Left as a cuDF list/string op chain
-    rather than a Python loop to keep it on GPU; the exact chain of list
-    accessor methods is the least-standard part of this file, most likely to
-    need hand-fixing against the installed cuDF version."""
+    """Initials-of-multi-token-name vs single-token-name match, vectorized
+    via list column ops. Uses the same explode -> groupby(agg=list) ->
+    list.join pattern already confirmed working in normalize.py's stopword
+    filtering (a real cluster run got through that step cleanly), instead
+    of a custom groupby aggregation lambda -- an earlier version of this
+    function used `.agg(lambda s: s.str.cat())`, which crashed on real
+    cluster data with `TypeError: object type does not support <lambda>
+    operations`: cuDF's groupby().agg() only supports built-in GPU-backed
+    aggregations, not arbitrary Python callables.
+
+    Caveat carried over from that same normalize.py pattern, not newly
+    introduced here: groupby-based list reconstruction's ordering
+    guarantee (does .agg(list) preserve original token order within each
+    group?) hasn't been directly confirmed, only that it runs without
+    error. Worth a quick spot check -- print name_norm for a few known
+    multi-word business names and confirm the words come out in the
+    original order, not shuffled.
+    """
     a_len = a_tokens.list.len()
     b_len = b_tokens.list.len()
     a_single = (a_len == 1)
@@ -84,7 +96,8 @@ def _gpu_acronym_match(a_tokens: cudf.Series, b_tokens: cudf.Series) -> cp.ndarr
     def initials_of(tokens_col, row_id):
         ex = cudf.DataFrame({"row_id": row_id, "token": tokens_col}).explode("token").dropna()
         ex["first_char"] = ex["token"].str.slice(0, 1)
-        return ex.groupby("row_id")["first_char"].agg(lambda s: s.str.cat())  # UNVERIFIED aggregation
+        grouped = ex.groupby("row_id")["first_char"].agg(list)
+        return grouped.list.astype("str").str.join(sep="")
 
     a_initials = initials_of(a_tokens, row_id).reindex(row_id.values)
     b_initials = initials_of(b_tokens, row_id).reindex(row_id.values)
