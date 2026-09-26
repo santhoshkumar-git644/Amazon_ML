@@ -161,9 +161,14 @@ def compute_features(pairs: cudf.DataFrame, s1_norm: cudf.DataFrame, other_norm:
     out["country_both_present"] = both_country.astype("int32")
     out["country_match"] = (both_country & (s1_country == o_country)).astype("int32")
 
+    # cuDF DataFrame has no pandas-style .get(key, default) -- use the same
+    # "in out.columns" check as blocking_score above instead.
     out["blocking_score"] = out["score"] if "score" in out.columns else out["name_jaccard"]
-    out["n_blocking_sources"] = out.get("n_blocking_sources", 1)
-    out["candidate_rank"] = out.get("candidate_rank", 0)
-    out["score_gap_to_next"] = out.get("score_gap_to_next", 0.0)
+    if "n_blocking_sources" not in out.columns:
+        out["n_blocking_sources"] = 1
+    if "candidate_rank" not in out.columns:
+        out["candidate_rank"] = 0
+    if "score_gap_to_next" not in out.columns:
+        out["score_gap_to_next"] = 0.0
 
     return out
