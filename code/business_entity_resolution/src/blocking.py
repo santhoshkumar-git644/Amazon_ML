@@ -83,6 +83,49 @@ def _token_join(s1_ex: cudf.DataFrame, other_ex: cudf.DataFrame, drop_tokens: cu
     return pairs
 
 
+def _keyed_join(s1_df: cudf.DataFrame, other_df: cudf.DataFrame, key_col: str,
+                 max_freq: int = MAX_TOKEN_ABS_FREQ) -> cudf.DataFrame:
+    """Join s1_df/other_df on key_col (postal_code, name_prefix, or
+    soundex1), restricted to (a) keys that actually occur in s1_df -- the
+    same lossless-for-an-inner-join restriction the token join uses -- and
+    (b) keys that aren't so common in either side they'd blow the join up
+    disproportionately, the same MAX_TOKEN_ABS_FREQ cap the token join uses.
+
+    Real crash this fixes: at 50,000 S1 entities, the soundex join alone
+    tried to allocate ~9.9GB and died. Soundex codes have very limited
+    cardinality (~26,000 possible 4-character codes) -- once S1 is large
+    enough, by pigeonhole it covers most of that space, so restriction (a)
+    alone stops helping (nearly the whole other-source table still passes
+    the filter). Postal code and name-prefix are lower-cardinality than
+    name tokens for the same reason, just less extreme than soundex. The
+    token join has always had this frequency cap (that's what fixed the
+    original CPU OOM); postal/prefix/soundex never did until now.
+    """
+    s1_valid = s1_df[key_col] != ""
+    other_valid = other_df[key_col] != ""
+    s1_keys = s1_df.loc[s1_valid, key_col]
+    other_keys = other_df.loc[other_valid, key_col]
+
+    s1_freq = s1_keys.value_counts()
+    other_freq = other_keys.value_counts()
+    drop_keys = cudf.concat([
+        s1_freq[s1_freq > max_freq].index.to_series(),
+        other_freq[other_freq > max_freq].index.to_series(),
+    ]).unique()
+
+    s1_key_set = s1_keys.unique()
+    s1_side = s1_df[s1_valid & (~s1_df[key_col].isin(drop_keys))][["entity_id", key_col]]
+    other_side = other_df[
+        other_valid & other_df[key_col].isin(s1_key_set) & (~other_df[key_col].isin(drop_keys))
+    ][["entity_id", key_col]]
+
+    pairs = s1_side.merge(other_side, on=key_col, suffixes=("_s1", "_o"))[
+        ["entity_id_s1", "entity_id_o"]
+    ]
+    pairs.columns = ["s1_id", "cand_id"]
+    return pairs
+
+
 def _score_unique_batch(batch: cudf.DataFrame, n: int) -> cudf.DataFrame:
     """Score one batch of unique (a, b) pairs. batch must have columns
     a, b, u_row_id (0..len(batch)-1). Returns batch with a "score" column
@@ -228,23 +271,10 @@ def build_candidates(s1_df: cudf.DataFrame, other_df: cudf.DataFrame, k: int = T
         )[["s1_id", "cand_id"]]
         token_pairs = cudf.concat([token_pairs, fallback_pairs], ignore_index=True)
 
-    s1_postal = s1_df.loc[s1_df["postal_code"] != "", "postal_code"].unique()
-    postal_pairs = s1_df[s1_df["postal_code"] != ""][["entity_id", "postal_code"]].merge(
-        other_df[other_df["postal_code"].isin(s1_postal)][["entity_id", "postal_code"]],
-        on="postal_code", suffixes=("_s1", "_o"),
-    )[["entity_id_s1", "entity_id_o"]]
-    postal_pairs.columns = ["s1_id", "cand_id"]
-
     s1_df = s1_df.copy()
     other_df = other_df.copy()
     s1_df["name_prefix"] = s1_df["name_norm"].str.slice(0, NAME_PREFIX_LEN)
     other_df["name_prefix"] = other_df["name_norm"].str.slice(0, NAME_PREFIX_LEN)
-    s1_prefixes = s1_df.loc[s1_df["name_prefix"] != "", "name_prefix"].unique()
-    prefix_pairs = s1_df[s1_df["name_prefix"] != ""][["entity_id", "name_prefix"]].merge(
-        other_df[other_df["name_prefix"].isin(s1_prefixes)][["entity_id", "name_prefix"]],
-        on="name_prefix", suffixes=("_s1", "_o"),
-    )[["entity_id_s1", "entity_id_o"]]
-    prefix_pairs.columns = ["s1_id", "cand_id"]
 
     # soundex: small per-distinct-first-token computation, done via the
     # pandas/CPU bridge (.to_pandas()) rather than a GPU kernel -- see
@@ -255,12 +285,10 @@ def build_candidates(s1_df: cudf.DataFrame, other_df: cudf.DataFrame, k: int = T
     other_df["soundex1"] = cudf.Series(
         other_df["name_core_tokens"].to_pandas().map(lambda ts: _soundex(ts[0]) if len(ts) else "")
     )
-    s1_soundex = s1_df.loc[s1_df["soundex1"] != "", "soundex1"].unique()
-    sdx_pairs = s1_df[s1_df["soundex1"] != ""][["entity_id", "soundex1"]].merge(
-        other_df[other_df["soundex1"].isin(s1_soundex)][["entity_id", "soundex1"]],
-        on="soundex1", suffixes=("_s1", "_o"),
-    )[["entity_id_s1", "entity_id_o"]]
-    sdx_pairs.columns = ["s1_id", "cand_id"]
+
+    postal_pairs = _keyed_join(s1_df, other_df, "postal_code")
+    prefix_pairs = _keyed_join(s1_df, other_df, "name_prefix")
+    sdx_pairs = _keyed_join(s1_df, other_df, "soundex1")
 
     all_pairs = cudf.concat([token_pairs, postal_pairs, prefix_pairs, sdx_pairs], ignore_index=True)
     if len(all_pairs) == 0:
