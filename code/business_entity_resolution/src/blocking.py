@@ -41,6 +41,14 @@ import pandas as pd
 
 MAX_TOKEN_ABS_FREQ = 2000    # drop join tokens present in more than this many records,
                               # regardless of corpus size (an absolute, not relative, cap)
+# postal_code/name_prefix/soundex1 are inherently lower-cardinality than name
+# tokens (soundex especially: only ~26,000 possible 4-character codes), so
+# reusing the token join's cap for them was too aggressive -- measured on the
+# GPU branch with real cluster data: it cut blocking recall ceiling from 0.68
+# to 0.54 at 50,000 S1 entities. More permissive on purpose; still caps the
+# pathological blowup case without pruning the normal signal these three
+# strategies contribute. May need further tuning at larger scale.
+KEYED_JOIN_MAX_FREQ = 10_000
 FALLBACK_MAX_PER_TOKEN = 200  # cap candidates contributed per fallback token (see build_candidates)
 TOP_K_CANDIDATES = 30        # final candidates kept per S1 entity after rescoring
 NAME_PREFIX_LEN = 4
@@ -95,7 +103,7 @@ def _token_join(s1_ex: pd.DataFrame, other_ex: pd.DataFrame, drop_tokens: set) -
 
 
 def _keyed_join(s1_df: pd.DataFrame, other_df: pd.DataFrame, key_col: str,
-                 max_freq: int = MAX_TOKEN_ABS_FREQ) -> pd.DataFrame:
+                 max_freq: int = KEYED_JOIN_MAX_FREQ) -> pd.DataFrame:
     """Join s1_df/other_df on key_col (postal_code, name_prefix, or
     soundex1), restricted to (a) keys that actually occur in s1_df -- the
     same lossless-for-an-inner-join restriction the token join uses -- and
