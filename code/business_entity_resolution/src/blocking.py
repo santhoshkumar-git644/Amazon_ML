@@ -98,7 +98,11 @@ def _gpu_char_ngram_cosine(s1_ids: cudf.Series, s1_names: cudf.Series,
     which cuML's text vectorizers generally track but not always exactly.
     """
     vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3), lowercase=False)
-    vectorizer.fit(all_names_for_fit)
+    # cuML's char-ngram tokenizer breaks on a raw ValueError("cannot reindex
+    # on an axis with duplicate labels") when the input text has many
+    # duplicate values -- fitting the vocabulary/IDF weights doesn't need
+    # repeated identical documents anyway, so dedup first.
+    vectorizer.fit(all_names_for_fit.unique())
 
     s1_vecs = vectorizer.transform(s1_names)
     cand_vecs = vectorizer.transform(cand_names)

@@ -46,7 +46,10 @@ def _gpu_pairwise_char_cosine(a: cudf.Series, b: cudf.Series, all_text_for_fit: 
     TF-IDF weighted, fit once over all_text_for_fit -- same GPU pattern as
     blocking.py's _gpu_char_ngram_cosine."""
     vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=ngram_range, lowercase=False)
-    vectorizer.fit(all_text_for_fit)
+    # See blocking.py's _gpu_char_ngram_cosine: cuML's char-ngram tokenizer
+    # breaks on duplicate-heavy input text with a raw cudf reindex
+    # ValueError. Fitting the vocabulary doesn't need duplicates anyway.
+    vectorizer.fit(all_text_for_fit.unique())
     va = vectorizer.transform(a)
     vb = vectorizer.transform(b)
 
