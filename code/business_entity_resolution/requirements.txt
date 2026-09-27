@@ -1,0 +1,6 @@
+pandas==3.0.3
+numpy==2.4.6
+scikit-learn==1.7.0
+lightgbm==4.7.0
+rapidfuzz==3.14.6
+pyarrow==25.0.1
